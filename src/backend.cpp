@@ -59,6 +59,14 @@ struct Backend::Impl {
     std::vector<PendingInput> pending;
     // Extra tensors to read back after compute (registered via capture_output).
     std::vector<PendingCapture> captures;
+    // Persistent metadata arena reused by every compute(). ggml's CUDA backend
+    // keys captured device graphs on the first node's address and re-captures
+    // whenever any node struct changes bit-wise; a freshly malloc'd arena per
+    // call made every compute look like a brand-new graph, so capture churn
+    // grew driver-held process memory without bound. A fixed arena makes an
+    // unchanged build sequence produce identical tensor structs at identical
+    // addresses, so the captured graph is simply re-used.
+    void * arena = nullptr;
 };
 
 // Thread-local pointer to the Backend whose compute() build lambda is currently
@@ -152,6 +160,7 @@ Backend::~Backend() {
         if (impl_->galloc)      ggml_gallocr_free(impl_->galloc);
         if (impl_->cpu_backend) ggml_backend_free(impl_->cpu_backend);
         if (impl_->backend)     ggml_backend_free(impl_->backend);
+        free(impl_->arena);
         delete impl_;
         impl_ = nullptr;
     }
@@ -188,10 +197,20 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
 
     // Metadata-only context: holds graph + tensor structs, no tensor data
     // (no_alloc=true). Tensor data lives in the gallocr's persistent buffer.
+    // The arena is owned by the Backend and reused across calls (see Impl);
+    // ggml_free below releases only the context header, not the buffer.
+    const size_t arena_size = ggml_tensor_overhead() * kGraphSize +
+                              ggml_graph_overhead_custom(kGraphSize, false);
+    if (!impl_->arena) {
+        impl_->arena = malloc(arena_size);
+        if (!impl_->arena) {
+            PK_LOG("Backend::compute: arena allocation failed");
+            return false;
+        }
+    }
     struct ggml_init_params params = {
-        /* .mem_size   = */ ggml_tensor_overhead() * kGraphSize +
-                            ggml_graph_overhead_custom(kGraphSize, false),
-        /* .mem_buffer = */ nullptr,
+        /* .mem_size   = */ arena_size,
+        /* .mem_buffer = */ impl_->arena,
         /* .no_alloc   = */ true,
     };
     struct ggml_context* ctx = ggml_init(params);
